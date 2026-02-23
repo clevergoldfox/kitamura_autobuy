@@ -1,0 +1,23 @@
+{
+    "products": [
+        {
+            "name": "GR III",
+            "min_price": 100000,
+            "max_price": 135100
+        },
+        {
+            "name": "RX10M4",
+            "min_price": 10000,
+            "max_price": 241000
+        },
+        {
+            "name": "EOS R5 Mark II",
+            "min_price": 10000,
+            "max_price": 113500
+        }
+    ],
+    "login": {
+        "email": "gopnoplll@gmail.com",
+        "password": "Morine0421"
+    }
+}
