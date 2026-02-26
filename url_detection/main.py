@@ -13,6 +13,7 @@ import queue
 import sys
 import threading
 import time
+import html
 
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
@@ -72,148 +73,204 @@ URL_WATCHER_SCRIPT = """
 
 PURCHASE_SCRIPT = """
 async () => {
+    const logs = [];
+
+    // Safe getter wrapper to avoid runtime errors
     const safeGet = (getter) => {
-        if (typeof getter !== "function") return null;
-        try {
-            return getter() || null;
-        } catch {
-            return null;
-        }
+        if (typeof getter !== 'function') return null;
+        try { return getter() || null; } catch (e) { return null; }
+    };
+    // Wait for element once (poll + MutationObserver); resolves a single time
+    const waitForElement = (getter, timeout = 3000, interval = 150) => {
+        return new Promise(resolve => {
+            const deadline = Date.now() + timeout;
+            let done = false;
+            let pollId = null;
+            let timerId = null;
+            let observer = null;
+
+            const finish = (el) => {
+                if (done) return;
+                done = true;
+                if (pollId) clearInterval(pollId);
+                if (timerId) clearTimeout(timerId);
+                if (observer) observer.disconnect();
+                resolve(el || null);
+            };
+
+            const tryGet = () => {
+                const el = safeGet(getter);
+                if (el) return finish(el);
+                if (Date.now() >= deadline) return finish(null);
+            };
+
+            // Immediate attempt
+            tryGet();
+
+            // Polling
+            pollId = setInterval(tryGet, interval);
+
+            // DOM observer for fast detection
+            try {
+                observer = new MutationObserver(tryGet);
+                observer.observe(document.documentElement || document.body, { childList: true, subtree: true, attributes: true });
+            } catch (e) {}
+
+            // Hard timeout
+            timerId = setTimeout(() => finish(null), timeout);
+        });
     };
 
-    const waitForElement = (getter, timeout = 3500, interval = 100) => new Promise((resolve) => {
-        const deadline = Date.now() + timeout;
-        const timerId = setInterval(() => {
-            const el = safeGet(getter);
-            if (el) {
-                clearInterval(timerId);
-                resolve(el);
-                return;
-            }
-            if (Date.now() >= deadline) {
-                clearInterval(timerId);
-                resolve(null);
-            }
-        }, interval);
-    });
+    // Locate the receive shop checkbox by id (no error)
+    const findReceiveShopCheckbox = () => {
+        const el = document.querySelector('#order-receive-shop');
+        if (!el) return null;
+        if (el.type !== "checkbox") return null;
+        if (el.offsetParent === null) return null; // hidden
+        return el;
+    };
 
-    const waitForUrlContains = (keyword, timeout = 6000) => new Promise((resolve) => {
-        const deadline = Date.now() + timeout;
-        const timerId = setInterval(() => {
-            if ((window.location.href || "").includes(keyword)) {
-                clearInterval(timerId);
-                resolve(true);
-                return;
-            }
-            if (Date.now() >= deadline) {
-                clearInterval(timerId);
-                resolve(false);
-            }
-        }, 100);
-    });
-
-    const fastClick = (xpaths, timeout = 3500) => {
+    // ULTRA-FAST click function with MutationObserver (supports multiple targets)
+    const fastClick = (xpaths, timeout = 3000) => {
         const targets = Array.isArray(xpaths) ? xpaths : [xpaths];
         return new Promise((resolve, reject) => {
             const start = Date.now();
             let clicked = false;
 
-            const tryClick = () => {
+            // Immediate check
+            const tryImmediate = () => {
                 if (clicked) return true;
                 for (const xpath of targets) {
-                    const node = document.evaluate(
-                        xpath,
-                        document,
-                        null,
-                        XPathResult.FIRST_ORDERED_NODE_TYPE,
-                        null
-                    ).singleNodeValue;
+                    const node = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
                     if (node && node.offsetParent !== null) {
                         clicked = true;
                         node.click();
-                        resolve(true);
                         return true;
                     }
                 }
                 return false;
             };
 
-            if (tryClick()) return;
+            if (tryImmediate()) {
+                resolve();
+                return;
+            }
 
-            const timerId = setInterval(() => {
-                if (tryClick()) {
-                    clearInterval(timerId);
-                    return;
+            let obs = null;
+            let tid = null;
+
+            const tryClick = () => {
+                if (clicked) return true;
+                for (const xpath of targets) {
+                    const el = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                    if (el && el.offsetParent !== null) {
+                        clicked = true;
+                        if (obs) obs.disconnect();
+                        if (tid) clearTimeout(tid);
+                        el.click();
+                        resolve();
+                        return true;
+                    }
                 }
-                if (Date.now() - start > timeout) {
-                    clearInterval(timerId);
-                    reject(new Error("click_timeout"));
+                return false;
+            };
+
+            // MutationObserver for instant detection
+            obs = new MutationObserver(tryClick);
+            obs.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
+
+            // 0ms polling fallback
+            const poll = () => {
+                if (clicked) return;
+                if (!tryClick() && Date.now() - start < timeout) {
+                    setTimeout(poll, 0);
                 }
-            }, 80);
+            };
+            poll();
+
+            tid = setTimeout(() => { if (obs) obs.disconnect(); if (!clicked) reject(new Error('Timeout')); }, timeout);
         });
     };
 
-    if (document.querySelector("span.not-sales-text")) {
-        return { error: "not_available" };
-    }
+    // Simple logger for debugging inside evaluate
+    const print = (msg) => { logs.push(String(msg)); console.log(msg); };
 
+    // Immediately dismiss modal dialogs with an OK button
+    const clickOkButtons = () => {
+        const candidates = Array.from(document.querySelectorAll('button, a, span, div'));
+        for (const el of candidates) {
+            const text = (el.textContent || '').trim();
+            if (/^OK$/i.test(text)) {
+                try { el.click(); return true; } catch (e) {}
+            }
+        }
+        const byRole = document.querySelector('[role="button"][title="OK"], [role="button"][aria-label="OK"]');
+        if (byRole) { try { byRole.click(); return true; } catch (e) {} }
+        return false;
+    };
+
+    // Check availability
+    if (document.querySelector('span.not-sales-text')) return { error: 'not_available' };
+
+    // Execute all steps
     try {
-        await fastClick(
-            "//button[contains(@class,'cart-button') and .//i[contains(@class,'cart-button-icon') and contains(@class,'fa-shopping-cart')]]"
-        );
-
+        await fastClick([
+            "//button[contains(@class,'cart-button') and .//i[contains(@class,'cart-button-icon') and contains(@class,'fa-shopping-cart')]]",
+        ]);
+        // Confirm in modal dialog if it appears
         try {
-            await fastClick(
-                [
-                    "//div[contains(@class,'cart-dialog') or contains(@class,'cart-dialog-basic')]//button[contains(@class,'cart-button') and .//span[contains(@class,'v-btn__content') and contains(normalize-space(),'予約する')]]",
-                    "//div[contains(@class,'cart-dialog') or contains(@class,'cart-dialog-basic')]//button[contains(normalize-space(),'購入手続きへ進む')]",
-                ],
-                900
-            );
-        } catch {}
+            await fastClick([
+                "//div[contains(@class,'cart-dialog') or contains(@class,'cart-dialog-basic')]//button[contains(@class,'cart-button') and .//span[contains(@class,'v-btn__content') and contains(normalize-space(),'予約する')]]",
+                "//div[contains(@class,'cart-dialog') or contains(@class,'cart-dialog-basic')]//button[contains(normalize-space(),'購入手続きへ進む')]",
+            ], 800);
+        } catch (e) {
+            // Modal may not appear; fall through to direct proceed button
+        }
+        await fastClick("//button[contains(@class,'action-btn') and contains(@class,'action-btn--white-text') and .//span[contains(@class,'v-btn__content') and contains(normalize-space(),'購入手続きへ進む')]]");
 
-        await fastClick(
-            "//button[contains(@class,'action-btn') and contains(@class,'action-btn--white-text') and .//span[contains(@class,'v-btn__content') and contains(normalize-space(),'購入手続きへ進む')]]"
-        );
-
-        const movedToCart = await waitForUrlContains("shop.kitamura.jp/ec/cart", 7000);
-        if (!movedToCart) return { error: "cart_timeout" };
-
-        await fastClick(
-            "//button[contains(@class,'v-btn--block') and contains(@class,'action-btn') and contains(@class,'action-btn--white-text') and .//span[contains(@class,'v-btn__content') and contains(normalize-space(),'購入手続きへ進む')]]"
-        );
-
-        const movedToOrder = await waitForUrlContains("shop.kitamura.jp/ec/order", 7000);
-        if (!movedToOrder) return { error: "order_timeout" };
-
-        const checkbox = await waitForElement(() => {
-            const el = document.querySelector("#order-receive-shop");
-            if (!el || el.type !== "checkbox" || el.offsetParent === null) return null;
-            return el;
+        // Wait for cart page
+        await new Promise(r => {
+            if (window.location.href.includes('shop.kitamura.jp/ec/cart')) { r(); return; }
+            const c = () => window.location.href.includes('shop.kitamura.jp/ec/cart') ? r() : setTimeout(c, 0);
+            c();
         });
-        if (!checkbox) return { error: "checkbox_not_found" };
 
+        await fastClick("//button[contains(@class,'v-btn--block') and contains(@class,'action-btn') and contains(@class,'action-btn--white-text') and .//span[contains(@class,'v-btn__content') and contains(normalize-space(),'購入手続きへ進む')]]");
+
+        // Wait for order page
+        await new Promise(r => {
+            if (window.location.href.includes('shop.kitamura.jp/ec/order')) { r(); return; }
+            const c = () => window.location.href.includes('shop.kitamura.jp/ec/order') ? r() : setTimeout(c, 0);
+            c();
+        });
+
+        // Attempt to click checkbox for "受取店舗" ONLY on /order page
+        const checkbox = await waitForElement(findReceiveShopCheckbox, 3000, 50);
+        if (!checkbox) {
+            print('checkbox not found (#order-receive-shop)');
+            return { error: 'checkbox_not_found', logs };
+        }
+
+        await new Promise(res => setTimeout(res, 150));
         checkbox.click();
-        if (!checkbox.checked) checkbox.click();
+        print('----------(1step)-------------');
 
-        await fastClick(
-            "//button[contains(@class,'order-action-btn') and contains(@class,'order-action-btn--white-text') and .//span[contains(@class,'v-btn__content') and contains(normalize-space(),'注文内容確認へ進む')]]"
-        );
+        if (!checkbox.checked) {
+            checkbox.click();
+        }
+        print('----------(2step)-------------');
+        await new Promise(res => setTimeout(res, 150));
+        await fastClick("//button[contains(@class,'order-action-btn') and contains(@class,'order-action-btn--white-text') and .//span[contains(@class,'v-btn__content') and contains(normalize-space(),'注文内容確認へ進む')]]");
+        await new Promise(res => setTimeout(res, 100));
 
-        try {
-            await fastClick(
-                "//button[contains(@class,'error-dialog-btn') and .//span[contains(@class,'v-btn__content') and normalize-space()='OK']]",
-                900
-            );
-        } catch {}
+        print('----------(3step)-------------');
+        clickOkButtons();
+        await fastClick("//button[contains(@class,'error-dialog-btn') and .//span[contains(@class,'v-btn__content') and normalize-space()='OK']]");
+        await fastClick("//button[contains(@class,'order-action-btn') and contains(@class,'order-action-btn--white-text') and .//span[contains(@class,'v-btn__content') and contains(normalize-space(),'注文確定')]]");
 
-        await fastClick(
-            "//button[contains(@class,'order-action-btn') and contains(@class,'order-action-btn--white-text') and .//span[contains(@class,'v-btn__content') and contains(normalize-space(),'注文確定')]]"
-        );
-
-        return { success: true };
+        return { success: true, logs };
     } catch (e) {
-        return { error: e && e.message ? e.message : "unknown_error" };
+        return { error: e.message, logs };
     }
 }
 """
@@ -229,7 +286,7 @@ class SignalEmitter(QObject):
 class UrlDetectionWindow(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("URL検知ツール")
+        self.setWindowTitle("中古品自動購入ツール")
         self.resize(760, 420)
 
         self.signal_emitter = SignalEmitter()
@@ -258,17 +315,13 @@ class UrlDetectionWindow(QWidget):
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(10)
 
-        title = QLabel("URL検知")
+        title = QLabel("中古品自動購入ツール")
         title.setStyleSheet("font-size: 18px; font-weight: bold;")
         root.addWidget(title)
 
         self.status_label = QLabel("状態: 停止中")
         self.status_label.setStyleSheet("color: #333;")
         root.addWidget(self.status_label)
-
-        self.target_label = QLabel(f"検知対象URL: {TARGET_URL_PART}")
-        self.target_label.setStyleSheet("color: #333;")
-        root.addWidget(self.target_label)
 
         button_row = QHBoxLayout()
         self.start_button = QPushButton("開始")
@@ -286,7 +339,8 @@ class UrlDetectionWindow(QWidget):
         root.addWidget(self.log_view)
 
     def add_log(self, message: str) -> None:
-        self.log_view.append(message)
+        safe_message = html.escape(str(message)).replace("\n", "<br>")
+        self.log_view.append(f"<p style='margin: 0 0 6px 0;'>{safe_message}</p>")
 
     def on_start(self) -> None:
         if not BROWSER_AVAILABLE:
@@ -462,18 +516,22 @@ class UrlDetectionWindow(QWidget):
                 raise RuntimeError("購入対象ページが見つかりません。")
 
             self.signal_emitter.log_signal.emit("購入処理を開始します...")
+            if target_url:
+                page.goto(target_url, wait_until="commit")
             result = page.evaluate(PURCHASE_SCRIPT)
+
+            if isinstance(result, dict):
+                for msg in result.get("logs", []):
+                    self.signal_emitter.log_signal.emit(str(msg))
 
             if isinstance(result, dict) and result.get("success"):
                 success = True
             else:
                 code = result.get("error") if isinstance(result, dict) else "unknown_error"
                 error_map = {
-                    "not_available": "商品は購入できない状態です。",
-                    "cart_timeout": "カート画面への遷移がタイムアウトしました。",
-                    "order_timeout": "注文画面への遷移がタイムアウトしました。",
-                    "checkbox_not_found": "受取方法チェックボックスが見つかりません。",
-                    "click_timeout": "画面要素のクリックがタイムアウトしました。",
+                    "not_available": "商品が販売可能ではありません。",
+                    "Timeout": "タイムアウト",
+                    "checkbox_not_found": "受取店舗のチェックボックスが見つかりません。",
                 }
                 err_msg = error_map.get(code, f"購入処理中に不明なエラーが発生しました（{code}）。")
         except Exception as exc:
