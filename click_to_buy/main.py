@@ -10,7 +10,7 @@ import json
 import threading
 import time
 import queue
-from PyQt5.QtCore import Qt, QPoint, QRectF, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, QPoint, QRectF, pyqtSignal, QObject, QTimer
 from PyQt5.QtGui import QFont, QPainter, QBrush, QPen, QColor, QLinearGradient
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton,
@@ -162,6 +162,7 @@ class PurchaseConfirmDialog(QFrame):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setFixedSize(360, 160)
         self.setStyleSheet("""
             PurchaseConfirmDialog {
@@ -230,7 +231,7 @@ class ResultDialog(QFrame):
 
     def set_message(self, success, error_message=""):
         if success:
-            self.message_label.setText("正確に購入しました。")
+            self.message_label.setText("正確に購入されました")
             self.message_label.setStyleSheet("font-size: 14px; color: #2E7D32;")
         else:
             self.message_label.setText("購入失敗\nエラー内容：" + (error_message or "不明"))
@@ -251,16 +252,22 @@ class CustomWindow(QWidget):
         self.playwright = None
         self.shop_browser = None
         self.shop_page = None
+        self.product_page = None  # 商品詳細を表示しているページ
+        self.product_was_new_tab = False  # 商品が新しいタブで開かれたか
         self.browser_thread = None
         self.browser_running = False
-        self.purchase_command_queue = queue.Queue()  # ('purchase', url) or ('go_back',)
+        self.purchase_command_queue = queue.Queue()  # ('purchase', url) or ('close_product_tab',)
+        self.notification_queue = queue.Queue()  # browser -> main: ('confirm', url)
         self.pending_click_url = None
         self.confirm_dialog = None
         self.result_dialog = None
+        self._notification_timer = None
 
         self.signal_emitter = SignalEmitter()
         self.signal_emitter.log_signal.connect(self._add_log_safe)
-        self.signal_emitter.product_clicked_signal.connect(self._on_product_clicked)
+        self.signal_emitter.product_clicked_signal.connect(
+            self._on_product_clicked, Qt.QueuedConnection
+        )
         self.signal_emitter.purchase_result_signal.connect(self._on_purchase_result)
 
         self.setWindowTitle("中古クリック購入ツール")
@@ -439,14 +446,23 @@ class CustomWindow(QWidget):
         self.add_log("ログイン情報をクリアしました")
 
     def _on_product_clicked(self, url):
-        self.pending_click_url = url
-        if not self.confirm_dialog:
-            self.confirm_dialog = PurchaseConfirmDialog(self)
-            self.confirm_dialog.yes_clicked.connect(self._on_confirm_yes)
-            self.confirm_dialog.no_clicked.connect(self._on_confirm_no)
-        self.confirm_dialog.show()
-        self.confirm_dialog.raise_()
-        self.confirm_dialog.activateWindow()
+        try:
+            self.pending_click_url = url
+            self.raise_()
+            self.activateWindow()
+            if not self.confirm_dialog:
+                self.confirm_dialog = PurchaseConfirmDialog(self)
+                self.confirm_dialog.yes_clicked.connect(self._on_confirm_yes)
+                self.confirm_dialog.no_clicked.connect(self._on_confirm_no)
+            self.confirm_dialog.setWindowTitle("購入確認")
+            self.confirm_dialog.show()
+            self.confirm_dialog.raise_()
+            self.confirm_dialog.activateWindow()
+            self.confirm_dialog.setWindowState((self.confirm_dialog.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+            QApplication.instance().processEvents()
+            self.add_log("購入確認を表示しました")
+        except Exception as e:
+            self.add_log(f"❌ 購入確認の表示に失敗しました: {e}")
 
     def _on_confirm_yes(self):
         if self.confirm_dialog:
@@ -461,6 +477,7 @@ class CustomWindow(QWidget):
         if self.confirm_dialog:
             self.confirm_dialog.hide()
         self.pending_click_url = None
+        self.purchase_command_queue.put(("close_product_tab", None))
         self.add_log("購入をキャンセルしました")
 
     def _on_purchase_result(self, success, error_message):
@@ -471,11 +488,27 @@ class CustomWindow(QWidget):
         self.result_dialog.show()
         self.result_dialog.raise_()
         self.result_dialog.activateWindow()
+        if success:
+            QTimer.singleShot(5000, self._on_result_confirm)
 
     def _on_result_confirm(self):
         if self.result_dialog:
             self.result_dialog.hide()
-        self.purchase_command_queue.put(("go_back", None))
+
+    def _poll_notification_queue(self):
+        """Main-thread timer: show purchase confirm when browser thread puts one."""
+        if not self.browser_running:
+            if self._notification_timer:
+                self._notification_timer.stop()
+                self._notification_timer = None
+            return
+        try:
+            while True:
+                item = self.notification_queue.get_nowait()
+                if item[0] == "confirm" and item[1]:
+                    self._on_product_clicked(item[1])
+        except queue.Empty:
+            pass
 
     def on_start(self):
         if not BROWSER_AVAILABLE:
@@ -485,6 +518,10 @@ class CustomWindow(QWidget):
             self.add_log("⚠ ブラウザは既に起動中です")
             return
         self.browser_running = True
+        if not self._notification_timer:
+            self._notification_timer = QTimer(self)
+            self._notification_timer.timeout.connect(self._poll_notification_queue)
+        self._notification_timer.start(250)
         self.browser_thread = threading.Thread(target=self._browser_loop, daemon=True)
         self.browser_thread.start()
         self.add_log("🌐 ブラウザを起動しています...")
@@ -514,6 +551,16 @@ class CustomWindow(QWidget):
             else:
                 self.shop_page = self.shop_browser.new_page()
             self.shop_page.set_default_timeout(60000)
+            self.product_page = None
+
+            def on_new_page(page):
+                self.product_page = page
+                try:
+                    page.set_default_timeout(60000)
+                except Exception:
+                    pass
+
+            self.shop_browser.on("page", on_new_page)
             self.add_log("✓ ブラウザを起動しました")
 
             # 中古一覧へ
@@ -576,87 +623,206 @@ class CustomWindow(QWidget):
             else:
                 pass
 
-            self.add_log("✓ 中古一覧を表示しました。商品をクリックすると購入確認が出ます。")
+            self.add_log("✓ 中古一覧を表示しました。商品ページを開くと購入確認が出ます。")
 
-            # 商品クリックをフックする binding（Python側で受ける）
-            def on_product_click(url):
+            self._product_dialog_pending = False  # ダイアログ表示中は再検出しない
+            self._last_debug_logged_url = None  # デバッグ重複防止
+            self._poll_count = 0
+
+            def on_product_page_opened(page, url, is_new_tab):
+                self.product_page = page
+                self.product_was_new_tab = is_new_tab
+                self._product_dialog_pending = True
+                self.add_log("🔔 商品ページを検出しました。購入確認を表示します。")
                 self.signal_emitter.product_clicked_signal.emit(url)
-
-            self.shop_page.expose_binding("onProductClick", lambda source, url: on_product_click(url))
-
-            def inject_click_handler():
-                # 商品リスト表示を待ってからクリックフックを登録（SPA対応）
-                self.shop_page.evaluate("""
-                    () => {
-                        const listUrl = 'list?type=u';
-                        function findProductUrlIn(container) {
-                            const links = container.querySelectorAll('a[href*="shop.kitamura.jp"]');
-                            for (const el of links) {
-                                const h = (el.getAttribute('href') || el.href || '');
-                                if (h.indexOf(listUrl) !== -1) continue;
-                                return el.href ? el.href : (h.startsWith('http') ? h : new URL(h, window.location.origin).href);
-                            }
-                            return null;
-                        }
-                        function findProductRow(el) {
-                            if (!el) return null;
-                            const byClass = el.closest('.product') || el.closest('[class*="product"]') || el.closest('.product-list > div');
-                            if (byClass) return byClass;
-                            if (!el.closest('#product-list-area')) return null;
-                            let n = el;
-                            while (n && n !== document.getElementById('product-list-area')) {
-                                if (findProductUrlIn(n)) return n;
-                                n = n.parentElement;
-                            }
-                            return null;
-                        }
-                        const handler = (e) => {
-                            const target = e.target;
-                            const productRow = findProductRow(target);
-                            const href = productRow ? findProductUrlIn(productRow) : null;
-                            if (href) {
-                                e.preventDefault();
-                                e.stopPropagation();
-                                window.onProductClick(href);
-                                return;
-                            }
-                            const directA = target.closest('a[href*="shop.kitamura.jp"]');
-                            if (directA && directA.closest('#product-list-area')) {
-                                const h = directA.href || directA.getAttribute('href') || '';
-                                if (h.indexOf(listUrl) === -1) {
-                                    e.preventDefault();
-                                    e.stopPropagation();
-                                    window.onProductClick(directA.href ? directA.href : (h.startsWith('http') ? h : new URL(h, window.location.origin).href));
-                                }
-                            }
-                        };
-                        if (window.__productClickHandler) {
-                            document.removeEventListener('click', window.__productClickHandler, true);
-                        }
-                        window.__productClickHandler = handler;
-                        document.addEventListener('click', handler, true);
-                    }
-                """)
-
-            # SPAで一覧が描画されるまで待ってからフックを登録
-            try:
-                self.shop_page.wait_for_selector(".product, [class*='product'], #product-list-area", timeout=8000)
-            except Exception:
-                pass
-            time.sleep(0.5)
-            inject_click_handler()
-
-            # コマンドループ: 購入 or 一覧に戻る
-            while self.browser_running and self.shop_page:
                 try:
-                    cmd = self.purchase_command_queue.get(timeout=0.5)
+                    self.notification_queue.put_nowait(("confirm", url))
+                except Exception:
+                    pass
+
+            def _is_product_url(url):
+                if not url or "kitamura" not in url:
+                    return False
+                if "/ec/used/" not in url or "/ec/list" in url:
+                    return False
+                return True
+
+            def check_all_pages_for_product_url():
+                if self._product_dialog_pending or not self.shop_browser:
+                    return
+                self._poll_count += 1
+                try:
+                    pages = self.shop_browser.pages()
+                    # 約10秒ごとに現在のタブ数とURLをログ（原因切り分け用）
+                    if self._poll_count % 50 == 1 and self._poll_count > 1:
+                        try:
+                            infos = []
+                            for i, p in enumerate(pages):
+                                if p.is_closed():
+                                    infos.append(f"タブ{i+1}: (閉じた)")
+                                else:
+                                    u = (p.url or "")[:70]
+                                    infos.append(f"タブ{i+1}: {u}")
+                            self.add_log("🔍 現在のタブ: " + " | ".join(infos))
+                        except Exception:
+                            pass
+                    for p in pages:
+                        if p.is_closed():
+                            continue
+                        try:
+                            # 常に location.href を優先（同一タブ遷移で p.url が遅れる場合がある）
+                            url = p.url or ""
+                            try:
+                                href = p.evaluate("() => typeof window !== 'undefined' && window.location && window.location.href ? window.location.href : ''")
+                                if href:
+                                    url = href
+                            except Exception:
+                                pass
+                            if not _is_product_url(url):
+                                if "ec/used" in url:
+                                    u = (url or "")[:85]
+                                    if u != getattr(self, "_last_debug_logged_url", None):
+                                        self._last_debug_logged_url = u
+                                        self.add_log("🔍 ec/used のURLを検出しましたがスキップ: " + u)
+                                continue
+                            if url != getattr(self, "_last_debug_logged_url", None):
+                                self._last_debug_logged_url = url
+                                self.add_log("🔍 商品URLを検出しました: " + (url[:80] or "") + " -> 購入確認を表示")
+                            on_product_page_opened(p, url, p != self.shop_page)
+                            return
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+            # 一覧タブが商品ページへ遷移したとき（即時検出）
+            def on_list_framenavigated(frame):
+                try:
+                    if frame != self.shop_page.main_frame:
+                        return
+                    url = frame.url or ""
+                    if not _is_product_url(url):
+                        try:
+                            url = self.shop_page.url or url
+                            if not _is_product_url(url):
+                                url = self.shop_page.evaluate("() => window.location.href || ''") or url
+                        except Exception:
+                            pass
+                    if not _is_product_url(url):
+                        _inject_url_watcher(self.shop_page)
+                        return
+                    if not self._product_dialog_pending:
+                        on_product_page_opened(self.shop_page, url, False)
+                    _inject_url_watcher(self.shop_page)
+                except Exception:
+                    pass
+
+            self.shop_page.on("framenavigated", on_list_framenavigated)
+
+            # 新しいタブで商品ページが開いたとき（即時検出）
+            def on_new_page(page):
+                try:
+                    page.set_default_timeout(60000)
+
+                    def on_new_page_framenavigated(frame):
+                        try:
+                            if frame != page.main_frame:
+                                return
+                            url = frame.url
+                            if not _is_product_url(url):
+                                return
+                            if not self._product_dialog_pending:
+                                on_product_page_opened(page, url, True)
+                        except Exception:
+                            pass
+
+                    page.on("framenavigated", on_new_page_framenavigated)
+                    _inject_url_watcher(page)
+                except Exception:
+                    pass
+
+            self.shop_browser.on("page", on_new_page)
+
+            # ページ内でURLが変わったら即通知する（SPA・pushState 対応）
+            URL_WATCHER_SCRIPT = """
+                (function() {
+                    if (window.__urlWatcherStarted) return;
+                    window.__urlWatcherStarted = true;
+                    window.__lastUrl = location.href;
+                    setInterval(function() {
+                        var h = location.href;
+                        if (window.__lastUrl !== h) {
+                            window.__lastUrl = h;
+                            if (window.notifyUrlChange) window.notifyUrlChange(h);
+                        }
+                    }, 150);
+                })();
+            """
+
+            _url_binding_pages = set()  #  binding を登録済みのページ
+
+            def _inject_url_watcher(p):
+                try:
+                    if p.is_closed():
+                        return
+                    # 各ページで binding を有効に（同一タブ遷移後も確実に通知）
+                    try:
+                        pid = id(p)
+                        if pid not in _url_binding_pages:
+                            p.expose_binding("notifyUrlChange", _on_url_changed)
+                            _url_binding_pages.add(pid)
+                    except Exception:
+                        pass
+                    p.evaluate(URL_WATCHER_SCRIPT)
+                except Exception:
+                    pass
+
+            def _on_url_changed(source, href):
+                try:
+                    if not href or not _is_product_url(href):
+                        return
+                    if self._product_dialog_pending:
+                        return
+                    page = getattr(source, "page", None)
+                    if not page or page.is_closed():
+                        return
+                    on_product_page_opened(page, href, page != self.shop_page)
+                except Exception:
+                    pass
+
+            try:
+                self.shop_browser.add_init_script(URL_WATCHER_SCRIPT)
+                _inject_url_watcher(self.shop_page)
+            except Exception as e:
+                self.add_log("⚠ URL変更のリアルタイム検出を有効にできませんでした: " + str(e))
+
+            # リアルタイム検出: 全タブのURLを定期的にチェック（フォールバック）
+            self.add_log("✓ 商品ページをリアルタイム検出（URL変更を即時検知・購入確認を表示）")
+
+            # コマンドループ + リアルタイムURLチェック
+            while self.browser_running and self.shop_page:
+                check_all_pages_for_product_url()
+                try:
+                    cmd = self.purchase_command_queue.get(timeout=0.2)
                 except queue.Empty:
+                    continue
+                self._product_dialog_pending = False
+                if cmd[0] == "close_product_tab":
+                    try:
+                        if self.product_page and not self.product_page.is_closed():
+                            if self.product_was_new_tab:
+                                self.product_page.close()
+                            else:
+                                self.product_page.goto(LIST_URL, wait_until="domcontentloaded")
+                        self.product_page = None
+                        self.add_log("📄 商品ページを閉じました")
+                    except Exception as e:
+                        self.add_log(f"閉じる際のエラー: {e}")
+                        self.product_page = None
                     continue
                 if cmd[0] == "go_back":
                     try:
                         self.shop_page.goto(LIST_URL, wait_until="domcontentloaded")
-                        time.sleep(0.3)
-                        inject_click_handler()
                         self.add_log("📄 中古一覧に戻りました")
                     except Exception as e:
                         self.add_log(f"一覧に戻る際のエラー: {e}")
@@ -665,10 +831,13 @@ class CustomWindow(QWidget):
                     _, product_url = cmd
                     success = False
                     err_msg = ""
+                    page_to_use = self.product_page if self.product_page and not self.product_page.is_closed() else None
+                    if not page_to_use:
+                        self.add_log("⚠ 商品ページが見つかりません")
+                        self.signal_emitter.purchase_result_signal.emit(False, "商品ページが閉じられている可能性があります")
+                        continue
                     try:
-                        self.shop_page.goto(product_url, wait_until="domcontentloaded")
-                        time.sleep(0.3)
-                        result = self.shop_page.evaluate(PURCHASE_SCRIPT)
+                        result = page_to_use.evaluate(PURCHASE_SCRIPT)
                         if result.get("error"):
                             err_map = {
                                 "not_available": "商品が販売可能ではありません",
@@ -680,7 +849,17 @@ class CustomWindow(QWidget):
                             success = bool(result.get("success"))
                     except Exception as e:
                         err_msg = str(e)
+                    try:
+                        if self.product_page and not self.product_page.is_closed():
+                            if self.product_was_new_tab:
+                                self.product_page.close()
+                            else:
+                                self.product_page.goto(LIST_URL, wait_until="domcontentloaded")
+                        self.product_page = None
+                    except Exception:
+                        pass
                     self.signal_emitter.purchase_result_signal.emit(success, err_msg)
+                self._product_dialog_pending = False
 
         except Exception as e:
             self.add_log(f"❌ ブラウザエラー: {str(e)}")

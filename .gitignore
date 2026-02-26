@@ -1,2 +1,4 @@
 data.json
 click_to_buy/browser_profile/*
+url_detection/browser_profile/*
+url_detection/__pycache__/*
